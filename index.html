@@ -1,0 +1,1084 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Audiobook Generator</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom scrollbar for the book list and page manager */
+        #book-list-container::-webkit-scrollbar, #page-list-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        #book-list-container::-webkit-scrollbar-thumb, #page-list-container::-webkit-scrollbar-thumb {
+            background-color: #d1d5db; /* gray-300 */
+            border-radius: 4px;
+        }
+        #book-list-container::-webkit-scrollbar-track, #page-list-container::-webkit-scrollbar-track {
+            background: #f3f4f6; /* gray-100 */
+        }
+        /* Style for re-order buttons */
+        .page-order-button {
+            transition: all 0.15s;
+        }
+        .page-order-button:hover {
+            transform: scale(1.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 flex flex-col min-h-screen font-sans">
+    
+    <!-- Firebase Initialization and Setup (Module Script) -->
+    <script type="module">
+        // Import all required Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        // IMPORT AND EXPOSE ALL NECESSARY FIRESTORE FUNCTIONS
+        import { getFirestore, doc, setDoc, onSnapshot, collection, deleteDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Enable debug logging for Firestore
+        setLogLevel('Debug');
+
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        if (Object.keys(firebaseConfig).length > 0) {
+            const app = initializeApp(firebaseConfig);
+            window.db = getFirestore(app);
+            window.auth = getAuth(app);
+
+            // --- Expose Firestore functions globally ---
+            window.doc = doc;
+            window.setDoc = setDoc;
+            window.collection = collection;
+            window.deleteDoc = deleteDoc;
+            window.onSnapshot = onSnapshot;
+            window.updateDoc = updateDoc;
+            // -------------------------------------------
+            
+            // Expose necessary state globally
+            window.isAuthReady = false;
+            window.userId = null;
+            window.currentBookId = null;
+            window.currentBook = null;
+            window.bookList = [];
+            window.currentPageList = []; // NEW: Store transcribed pages here
+            window.pageUnsubscribe = null; // NEW: Listener for the pages subcollection
+            
+            // --- Function Definitions ---
+            
+            /** Loads the list of books for the current user and sets up the listener. */
+            function loadBookList() {
+                if (!window.db || !window.userId) {
+                    console.error("[FIRESTORE] Cannot load book list: DB or User ID missing.");
+                    return;
+                }
+                
+                const booksColRef = window.collection(window.db, `artifacts/${appId}/users/${window.userId}/books`);
+                
+                window.onSnapshot(booksColRef, (snapshot) => {
+                    window.bookList = [];
+                    snapshot.forEach(doc => {
+                        window.bookList.push({ id: doc.id, ...doc.data() });
+                    });
+                    
+                    // Sort the list by lastUpdated (descending) in memory
+                    window.bookList.sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
+                    
+                    window.renderBookList(); // Now properly scoped and exposed
+                    
+                    // If no book is selected, select the first one or clear the editor
+                    if (!window.currentBookId && window.bookList.length > 0) {
+                        loadBookForEditing(window.bookList[0].id);
+                    } else if (window.bookList.length === 0) {
+                        loadBookForEditing(null); 
+                    } else if (window.currentBookId) {
+                        // Ensure the current book is updated if its metadata changed
+                        const updatedBook = window.bookList.find(b => b.id === window.currentBookId);
+                        if (updatedBook) {
+                            window.currentBook = updatedBook;
+                            document.getElementById('editor-title').textContent = updatedBook.title || 'Untitled Book';
+                        }
+                    }
+                }, (error) => {
+                    console.error("[FIRESTORE] Error fetching book list:", error);
+                });
+            }
+
+
+            /** Renders the sidebar list of books.
+             * CRITICAL FIX: Moved outside loadBookList to be globally accessible. 
+             */
+            function renderBookList() {
+                const container = document.getElementById('book-list-container');
+                container.innerHTML = '';
+                
+                if (window.bookList.length === 0) {
+                    container.innerHTML = `<p class="text-gray-500 p-4 text-center">No books yet. Click 'New Book' to start!</p>`;
+                    return;
+                }
+
+                window.bookList.forEach(book => {
+                    const bookTitle = book.title || 'Untitled Book';
+                    const isActive = book.id === window.currentBookId;
+                    const date = book.lastUpdated ? new Date(book.lastUpdated).toLocaleDateString() : '';
+                    
+                    const item = document.createElement('div');
+                    item.className = `p-3 cursor-pointer rounded-lg transition duration-150 ease-in-out flex justify-between items-center group
+                                    ${isActive ? 'bg-indigo-600 text-white shadow-lg' : 'hover:bg-gray-200 text-gray-800'}`;
+                    item.onclick = () => loadBookForEditing(book.id);
+
+                    item.innerHTML = `
+                        <div class="truncate pr-2">
+                            <p class="font-semibold truncate">${bookTitle}</p>
+                            <p class="text-xs ${isActive ? 'text-indigo-200' : 'text-gray-500'}">${date}</p>
+                        </div>
+                        <button onclick="event.stopPropagation(); deleteBook('${book.id}', '${bookTitle}');" 
+                                class="text-red-300 hover:text-red-500 p-1 rounded-full transition duration-150 opacity-0 group-hover:opacity-100 ${isActive ? 'opacity-100' : ''}">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                        </button>
+                    `;
+                    container.appendChild(item);
+                });
+            }
+            window.renderBookList = renderBookList; // Expose globally
+
+
+            /** Sets up the listener for the pages subcollection of the current book. */
+            function setupPageListener(bookId) {
+                // Unsubscribe from previous listener if active
+                if (window.pageUnsubscribe) {
+                    window.pageUnsubscribe();
+                    window.currentPageList = [];
+                }
+
+                if (!bookId) return;
+
+                const pagesColRef = window.collection(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${bookId}/pages`);
+                
+                window.pageUnsubscribe = window.onSnapshot(pagesColRef, (snapshot) => {
+                    window.currentPageList = [];
+                    snapshot.forEach(doc => {
+                        window.currentPageList.push({ id: doc.id, ...doc.data() });
+                    });
+                    
+                    // Always sort pages by 'order' in memory
+                    window.currentPageList.sort((a, b) => a.order - b.order);
+                    
+                    // Re-render the pages list and the aggregated manuscript preview
+                    renderPages();
+                    renderManuscriptPreview();
+
+                    console.log(`[FIRESTORE] Loaded ${window.currentPageList.length} pages for book ${bookId}`);
+                }, (error) => {
+                    console.error("[FIRESTORE] Error fetching pages:", error);
+                });
+            }
+            
+            // --- Authentication and Setup ---
+            
+            // Authentication Listener
+            onAuthStateChanged(window.auth, async (user) => {
+                if (user) {
+                    window.userId = user.uid;
+                } else {
+                    // Sign in with custom token if available, otherwise anonymously
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(window.auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(window.auth);
+                        }
+                    } catch(error) {
+                        console.error("[AUTH] Error during sign-in:", error);
+                    }
+                }
+
+                // If auth is finalized and we have a user ID, set ready state and start listening to data
+                if (window.auth.currentUser) {
+                    window.userId = window.auth.currentUser.uid;
+                    window.isAuthReady = true;
+                    document.getElementById('auth-status').textContent = `User: ${window.userId.substring(0, 8)}...`;
+                    document.dispatchEvent(new Event('authReady'));
+                } else {
+                    window.isAuthReady = true; 
+                    document.getElementById('auth-status').textContent = 'User: Anonymous (Ready)';
+                    document.dispatchEvent(new Event('authReady')); // Trigger ready even if anon
+                }
+            });
+            
+            // Listen for the authReady event to initialize Firestore listeners
+            document.addEventListener('authReady', () => {
+                if (window.userId) {
+                    loadBookList();
+                }
+            });
+            
+            
+            // Expose essential functions globally for the main script block
+            window.setupPageListener = setupPageListener;
+            window.loadBookForEditing = loadBookForEditing;
+            window.newBook = newBook;
+            window.saveBook = saveBook;
+            window.deleteBook = deleteBook;
+            window.runOcrFromInput = runOcrFromInput; 
+            window.generateAudiobook = generateAudiobook; 
+            window.previewVoice = previewVoice; 
+            window.renderPages = renderPages; // Expose renderer
+            window.editPageText = editPageText; // Expose edit function
+            window.movePage = movePage; // Expose re-order function
+            window.deletePage = deletePage; // Expose delete function
+        }
+        
+    </script>
+
+
+    <!-- Main Content Layout -->
+    <header class="bg-indigo-700 text-white shadow-md p-4 flex justify-between items-center">
+        <h1 class="text-2xl font-bold tracking-tight">📚 AI Audiobook Studio</h1>
+        <p id="auth-status" class="text-sm text-indigo-200"></p>
+    </header>
+
+    <main class="flex flex-1 overflow-hidden">
+        
+        <!-- Sidebar for Book List -->
+        <div class="w-72 bg-gray-100 border-r border-gray-300 flex flex-col">
+            <div class="p-4 border-b border-gray-300">
+                <button 
+                    onclick="window.newBook()" 
+                    id="new-book-button"
+                    class="w-full bg-indigo-500 hover:bg-indigo-600 text-white font-semibold py-2 px-4 rounded-xl transition duration-200 shadow-md hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50">
+                    + New Book
+                </button>
+            </div>
+            <div id="book-list-container" class="flex-1 overflow-y-auto space-y-2 p-4">
+                <!-- Book items will be injected here by renderBookList() -->
+                <p class="text-gray-500 p-4 text-center">Loading books...</p>
+            </div>
+        </div>
+
+        <!-- Main Editor/Generator Area -->
+        <div class="flex-1 p-6 overflow-y-auto space-y-6">
+            <h2 id="editor-title" class="text-3xl font-extrabold text-gray-900">Editor</h2>
+            <p id="editor-subtitle" class="text-gray-500"></p>
+            
+            <!-- Book Metadata Form -->
+            <div id="book-form" class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <div class="space-y-4">
+                    <div>
+                        <label for="book-title" class="block text-sm font-medium text-gray-700">Book Title</label>
+                        <input type="text" id="book-title" oninput="debounceSaveTitle()" placeholder="e.g., The Last Starship" 
+                               class="mt-1 block w-full border border-gray-300 rounded-lg shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500">
+                    </div>
+                    
+                    <!-- OCR Upload Area -->
+                    <div class="border-t border-gray-200 pt-4">
+                        <h3 class="text-lg font-bold text-gray-800 flex items-center mb-2">
+                             <svg class="w-5 h-5 mr-2 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                            Image-to-Page OCR
+                        </h3>
+                        <input type="file" id="image-upload" accept="image/*" multiple 
+                               class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"/>
+                        <button onclick="runOcrFromInput()" id="ocr-button" disabled
+                                class="w-full mt-3 bg-teal-500 hover:bg-teal-600 text-white font-semibold py-2 px-4 rounded-xl transition duration-200 shadow-md disabled:opacity-50">
+                            Perform OCR & Add Pages (0 files selected)
+                        </button>
+                        <p id="ocr-status" class="text-sm mt-2 text-gray-500 text-center">Upload up to 10 page images (JPG/PNG). Text will be transcribed into separate pages.</p>
+                    </div>
+                </div>
+
+                <div class="mt-6 flex justify-between items-center border-t pt-4">
+                    <button onclick="saveBook()" id="save-button" class="bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-4 rounded-xl transition duration-200 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50">
+                        Save Title
+                    </button>
+                    <p id="save-status" class="text-sm text-gray-600 italic">Unsaved</p>
+                </div>
+            </div>
+            
+            <!-- Page Manager -->
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <h3 class="text-xl font-bold text-gray-800 mb-4">Page Manager (<span id="page-count">0</span> Pages)</h3>
+                <div id="page-list-container" class="space-y-3 max-h-96 overflow-y-auto">
+                    <!-- Pages will be injected here -->
+                    <p class="text-gray-500 text-center p-4">Pages will appear here after OCR or manual creation.</p>
+                </div>
+            </div>
+
+            <!-- Manuscript Preview (Read Only) -->
+            <div class="bg-gray-100 p-6 rounded-xl shadow-inner border border-gray-300">
+                 <h3 class="text-xl font-bold text-gray-800 mb-2">Full Manuscript Preview</h3>
+                 <p class="text-sm text-gray-600 mb-4">This is the complete text that will be sent for narration. Edit individual pages above.</p>
+                <textarea id="book-content-preview" rows="15" readonly
+                          placeholder="Your complete book manuscript will be aggregated and displayed here based on the pages above..."
+                          class="mt-1 block w-full border border-gray-300 rounded-lg shadow-sm p-3 bg-white font-mono text-sm resize-none"></textarea>
+            </div>
+
+            <!-- Audiobook Generation Area -->
+            <div class="bg-indigo-100 p-6 rounded-xl shadow-lg border border-indigo-300 space-y-4">
+                <h3 class="text-xl font-bold text-indigo-800">Generate Audiobook</h3>
+                
+                <!-- Voice Selection and Preview -->
+                <div class="space-y-3">
+                    <label for="voice-select" class="block text-sm font-medium text-indigo-700">Select Narrator Voice</label>
+                    <select id="voice-select" 
+                            class="block w-full border border-indigo-300 rounded-lg shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500 bg-white">
+                        <!-- Options populated by JS -->
+                    </select>
+                    <button onclick="previewVoice()" id="preview-button" 
+                            class="w-full bg-indigo-400 hover:bg-indigo-500 text-white font-semibold py-2 px-4 rounded-xl transition duration-200 shadow-md disabled:opacity-50">
+                        Preview Voice
+                    </button>
+                    <p id="preview-status" class="text-center text-sm text-gray-600"></p>
+                </div>
+
+                <button onclick="generateAudiobook()" id="generate-button" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-xl transition duration-200 shadow-md hover:shadow-lg disabled:opacity-50">
+                    Generate Full Narration
+                </button>
+                
+                <p id="generation-status" class="text-center text-gray-600 text-sm">Status: Ready to generate.</p>
+                
+                <!-- Audio Playback and Download -->
+                <div id="audio-output" class="hidden space-y-3 pt-4">
+                    <audio id="audio-player" controls class="w-full"></audio>
+                    <button onclick="downloadAudio()" id="download-button" class="w-full bg-teal-500 hover:bg-teal-600 text-white font-semibold py-2 px-4 rounded-xl transition duration-200">
+                        Download WAV File
+                    </button>
+                </div>
+                <p id="no-audio-message" class="text-center text-sm text-gray-500">Audio playback controls will appear here after generation or preview.</p>
+            </div>
+        </div>
+    </main>
+
+
+    <!-- Main Application Logic (Standard Script) -->
+    <script>
+        let saveTimeout;
+        let generatedAudioBlob = null;
+        const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+        const VISION_MODEL = "gemini-2.5-flash-preview-09-2025";
+        
+        // Voice configuration
+        const VOICES = [
+            { name: "Leda (Youthful, Default)", value: "Leda" },
+            { name: "Zephyr (Bright)", value: "Zephyr" },
+            { name: "Puck (Upbeat)", value: "Puck" },
+            { name: "Charon (Informative)", value: "Charon" },
+            { name: "Kore (Firm)", value: "Kore" },
+            { name: "Fenrir (Excitable)", value: "Fenrir" },
+            { name: "Orus (Firm)", value: "Orus" },
+            { name: "Aoede (Breezy)", value: "Aoede" },
+            { name: "Callirrhoe (Easy-going)", value: "Callirrhoe" },
+            { name: "Autonoe (Bright)", value: "Autonoe" },
+        ];
+        const DEFAULT_VOICE = "Leda";
+        const PREVIEW_TEXT = "Hello! This is a preview of the selected voice for your audiobook.";
+
+
+        document.addEventListener('DOMContentLoaded', () => {
+            populateVoiceSelect();
+            
+            // OCR setup
+            const fileInput = document.getElementById('image-upload');
+            const ocrButton = document.getElementById('ocr-button');
+            const ocrStatus = document.getElementById('ocr-status');
+
+            fileInput.addEventListener('change', () => {
+                const files = fileInput.files;
+                if (window.currentBookId) {
+                    if (files.length > 0) {
+                        ocrButton.disabled = false;
+                        ocrButton.textContent = `Perform OCR & Add Pages (${files.length} files selected)`;
+                        ocrStatus.textContent = `Ready to process ${files.length} image(s).`;
+                    } else {
+                        ocrButton.disabled = true;
+                        ocrButton.textContent = `Perform OCR & Add Pages (0 files selected)`;
+                        ocrStatus.textContent = "Upload up to 10 page images (JPG/PNG). Text will be transcribed into separate pages.";
+                    }
+                } else {
+                     ocrStatus.textContent = "Please select a book first before uploading images.";
+                     ocrButton.disabled = true;
+                }
+            });
+        });
+
+        /** Populates the voice select dropdown with predefined voices. */
+        function populateVoiceSelect() {
+            const select = document.getElementById('voice-select');
+            VOICES.forEach(voice => {
+                const option = document.createElement('option');
+                option.value = voice.value;
+                option.textContent = voice.name;
+                if (voice.value === DEFAULT_VOICE) {
+                    option.selected = true;
+                }
+                select.appendChild(option);
+            });
+        }
+
+        /** Debounces the save title function. */
+        function debounceSaveTitle() {
+            document.getElementById('save-status').textContent = "Typing...";
+            clearTimeout(saveTimeout);
+            saveTimeout = setTimeout(() => {
+                saveBook();
+            }, 1000);
+        }
+
+        /** Creates a new book document in Firestore and sets it as the current book. */
+        async function newBook() {
+            console.log("--- New Book Clicked ---");
+            if (!window.isAuthReady || !window.userId) {
+                console.error("[FIRESTORE] Auth is not ready yet or User ID is missing.");
+                document.getElementById('save-status').textContent = "Error: Authentication not ready.";
+                return;
+            }
+            
+            const newBookId = crypto.randomUUID();
+            const defaultTitle = `Untitled Book ${window.bookList.length + 1}`;
+            const newBookData = {
+                title: defaultTitle,
+                lastUpdated: Date.now(),
+            };
+
+            try {
+                const bookDocRef = window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${newBookId}`);
+                await window.setDoc(bookDocRef, newBookData);
+
+                loadBookForEditing(newBookId); 
+                
+                document.getElementById('save-status').textContent = "New book created!";
+
+            } catch (error) {
+                console.error("[FIRESTORE] Firestore creation failed:", error);
+                document.getElementById('save-status').textContent = `Error creating book: ${error.message.substring(0, 50)}...`;
+            }
+        }
+        
+        /** Saves the current book's metadata (Title) to Firestore. */
+        async function saveBook() {
+            if (!window.currentBookId || !window.userId) {
+                document.getElementById('save-status').textContent = "Cannot save: No book selected or user not logged in.";
+                return;
+            }
+
+            const title = document.getElementById('book-title').value.trim() || 'Untitled Book';
+            
+            const updatedData = {
+                title: title,
+                lastUpdated: Date.now(),
+            };
+
+            try {
+                const bookDocRef = window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${window.currentBookId}`);
+                await window.updateDoc(bookDocRef, updatedData);
+                window.currentBook = { ...window.currentBook, ...updatedData }; 
+                
+                document.getElementById('save-status').textContent = "Title saved successfully!";
+                document.getElementById('editor-title').textContent = title;
+                
+            } catch (error) {
+                console.error("Error saving book:", error);
+                document.getElementById('save-status').textContent = `Error saving: ${error.message}`;
+            }
+        }
+        
+        /** Loads a book's content into the editor form and sets up page listener. */
+        function loadBookForEditing(bookId) {
+            // Cleanup existing listener
+            if (window.pageUnsubscribe) window.pageUnsubscribe();
+
+            if (!bookId) {
+                window.currentBookId = null;
+                window.currentBook = null;
+                window.currentPageList = [];
+                document.getElementById('editor-title').textContent = "No Book Selected";
+                document.getElementById('editor-subtitle').textContent = "Create a new book or select one from the list.";
+                document.getElementById('book-title').value = '';
+                document.getElementById('save-status').textContent = "Ready";
+                document.getElementById('audio-output').classList.add('hidden');
+                document.getElementById('no-audio-message').classList.remove('hidden');
+                document.getElementById('generation-status').textContent = "Status: Ready to generate.";
+                document.getElementById('preview-status').textContent = "";
+                document.getElementById('image-upload').value = '';
+                document.getElementById('ocr-button').disabled = true;
+                document.getElementById('ocr-button').textContent = `Perform OCR & Add Pages (0 files selected)`;
+                document.getElementById('ocr-status').textContent = "Upload up to 10 page images (JPG/PNG). Text will be transcribed into separate pages.";
+                window.renderPages(); // Clear page list
+                renderManuscriptPreview(); // Clear manuscript
+                return;
+            }
+            
+            const book = window.bookList.find(b => b.id === bookId);
+
+            if (book) {
+                window.currentBookId = bookId;
+                window.currentBook = book;
+                
+                document.getElementById('editor-title').textContent = book.title || 'Untitled Book';
+                document.getElementById('editor-subtitle').textContent = `ID: ${bookId.substring(0, 8)}...`;
+                document.getElementById('book-title').value = book.title || '';
+                document.getElementById('save-status').textContent = "Loaded";
+
+                // 1. Setup real-time listener for the pages subcollection
+                window.setupPageListener(bookId);
+                
+                // 2. Update the UI list to highlight the active book
+                window.renderBookList();
+            }
+        }
+
+        /** Deletes a book after user confirmation. */
+        async function deleteBook(bookId, bookTitle) {
+            if (!window.userId) return;
+
+            const confirmed = window.confirm(`Are you sure you want to delete the book "${bookTitle}"? This will delete all its pages.`);
+            if (!confirmed) return;
+            
+            try {
+                // Delete the book document (Firestore security rules should handle subcollection deletion)
+                const bookDocRef = window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${bookId}`);
+                await window.deleteDoc(bookDocRef);
+                
+                if (window.currentBookId === bookId) {
+                    loadBookForEditing(null);
+                }
+
+                console.log(`[FIRESTORE] Book deleted: ${bookId}`);
+                
+            } catch (error) {
+                console.error("Error deleting book:", error);
+            }
+        }
+
+        // --- NEW PAGE MANAGEMENT FUNCTIONS ---
+
+        /** Renders the list of pages in the Page Manager section. */
+        function renderPages() {
+            const container = document.getElementById('page-list-container');
+            const pageCount = document.getElementById('page-count');
+            container.innerHTML = '';
+            pageCount.textContent = window.currentPageList.length;
+
+            if (window.currentPageList.length === 0) {
+                container.innerHTML = `<p class="text-gray-500 text-center p-4">No pages yet. Use OCR above or add manually.</p>`;
+                return;
+            }
+
+            window.currentPageList.forEach((page, index) => {
+                const item = document.createElement('div');
+                item.className = 'flex items-start bg-gray-50 p-3 rounded-lg border border-gray-200 shadow-sm';
+                item.innerHTML = `
+                    <div class="flex flex-col items-center mr-4 pt-1">
+                        <button onclick="movePage('${page.id}', -1)" ${index === 0 ? 'disabled' : ''}
+                                class="page-order-button text-gray-400 hover:text-indigo-500 disabled:opacity-30 disabled:hover:text-gray-400">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
+                        </button>
+                        <span class="font-bold text-lg text-gray-700">P${index + 1}</span>
+                        <button onclick="movePage('${page.id}', 1)" ${index === window.currentPageList.length - 1 ? 'disabled' : ''}
+                                class="page-order-button text-gray-400 hover:text-indigo-500 disabled:opacity-30 disabled:hover:text-gray-400">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                        </button>
+                    </div>
+                    <div class="flex-1">
+                        <textarea id="page-text-${page.id}" oninput="debounceSavePage('${page.id}')" rows="5"
+                                  class="w-full text-sm p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">${page.text || ''}</textarea>
+                        <p class="text-xs text-gray-500 mt-1">Saved automatically.</p>
+                    </div>
+                    <button onclick="deletePage('${page.id}')" class="ml-4 mt-1 text-red-400 hover:text-red-600 p-2 rounded-full transition duration-150">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                    </button>
+                `;
+                container.appendChild(item);
+            });
+        }
+        
+        /** Renders the read-only aggregated manuscript preview. */
+        function renderManuscriptPreview() {
+            const previewTextarea = document.getElementById('book-content-preview');
+            // Aggregate all text, separated by a distinct page break marker
+            const aggregatedText = window.currentPageList
+                .map(page => page.text)
+                .filter(text => text && text.trim().length > 0)
+                .join('\n\n--- Page Break ---\n\n');
+
+            previewTextarea.value = aggregatedText || "No content found in pages. Please upload images or add pages to generate the manuscript.";
+        }
+
+        /** Debounces the save function for individual pages. */
+        function debounceSavePage(pageId) {
+            // We use a different debounce system here, focusing on the specific page element
+            const pageTextarea = document.getElementById(`page-text-${pageId}`);
+            if (pageTextarea) {
+                // Clear any previous debounce for this page
+                if (pageTextarea.saveTimeout) clearTimeout(pageTextarea.saveTimeout);
+                
+                pageTextarea.saveTimeout = setTimeout(() => {
+                    editPageText(pageId, pageTextarea.value);
+                }, 800);
+            }
+        }
+        
+        /** Saves the text content of an individual page. */
+        async function editPageText(pageId, newText) {
+            if (!window.currentBookId || !window.userId) return;
+
+            try {
+                const pageDocRef = window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${window.currentBookId}/pages/${pageId}`);
+                await window.updateDoc(pageDocRef, { text: newText });
+                // The page listener will automatically re-render everything
+            } catch (error) {
+                console.error(`Error updating page ${pageId}:`, error);
+            }
+        }
+
+        /** Moves a page up or down by swapping its order with the adjacent page. */
+        async function movePage(pageId, direction) {
+            if (!window.currentBookId || !window.userId) return;
+
+            const currentIndex = window.currentPageList.findIndex(p => p.id === pageId);
+            const targetIndex = currentIndex + direction;
+
+            if (targetIndex < 0 || targetIndex >= window.currentPageList.length) {
+                return; // Cannot move past boundaries
+            }
+
+            const currentPage = window.currentPageList[currentIndex];
+            const targetPage = window.currentPageList[targetIndex];
+
+            // Perform a safe swap by updating the 'order' field for both documents
+            const batchUpdates = [
+                window.updateDoc(window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${window.currentBookId}/pages/${currentPage.id}`), { order: targetPage.order }),
+                window.updateDoc(window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${window.currentBookId}/pages/${targetPage.id}`), { order: currentPage.order }),
+            ];
+
+            try {
+                // Awaiting both to ensure listener catches the change, but no batch write available here
+                await Promise.all(batchUpdates);
+            } catch (error) {
+                console.error("Error moving page:", error);
+            }
+        }
+
+        /** Deletes an individual page document. */
+        async function deletePage(pageId) {
+            if (!window.currentBookId || !window.userId) return;
+
+            const confirmed = window.confirm(`Are you sure you want to delete this page?`);
+            if (!confirmed) return;
+            
+            try {
+                const pageDocRef = window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${window.currentBookId}/pages/${pageId}`);
+                await window.deleteDoc(pageDocRef);
+                // The page listener will automatically re-render everything
+            } catch (error) {
+                console.error(`Error deleting page ${pageId}:`, error);
+            }
+        }
+
+        // --- END NEW PAGE MANAGEMENT FUNCTIONS ---
+        
+
+        /** Helper function to read a File object as a Base64 string. */
+        function readFileAsBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = error => reject(error);
+                reader.readAsDataURL(file);
+            });
+        }
+        
+        /** Orchestrates the OCR process using the image input. */
+        async function runOcrFromInput() {
+            const fileInput = document.getElementById('image-upload');
+            const files = fileInput.files;
+
+            if (!files.length) {
+                document.getElementById('ocr-status').textContent = "Please select image files first.";
+                return;
+            }
+            
+            if (!window.currentBookId) {
+                 document.getElementById('ocr-status').textContent = "Please create or select a book before running OCR.";
+                return;
+            }
+
+            const MAX_PAGES = 10;
+            const filesToProcess = Array.from(files).slice(0, MAX_PAGES);
+            
+            if (files.length > MAX_PAGES) {
+                document.getElementById('ocr-status').textContent = `Warning: Processing the first ${MAX_PAGES} files only.`;
+            }
+
+            await runOcrAndAddPages(filesToProcess);
+        }
+
+        /**
+         * Sends multiple images to the Gemini API for OCR and saves them as separate page documents.
+         * @param {File[]} files The list of image files to process.
+         */
+        async function runOcrAndAddPages(files) {
+            const ocrButton = document.getElementById('ocr-button');
+            const ocrStatus = document.getElementById('ocr-status');
+
+            ocrButton.disabled = true;
+            ocrStatus.textContent = `Processing ${files.length} images... This may take a moment.`;
+            ocrStatus.classList.remove('text-red-500', 'text-green-600');
+            ocrStatus.classList.add('text-gray-600');
+
+            try {
+                const base64Parts = [];
+                for (const file of files) {
+                    const base64DataUrl = await readFileAsBase64(file);
+                    const base64 = base64DataUrl.split(',')[1]; 
+                    base64Parts.push({
+                        inlineData: {
+                            mimeType: file.type,
+                            data: base64
+                        }
+                    });
+                }
+                
+                // Use structured output to ensure we get an array of page texts
+                const systemPrompt = "You are an expert OCR and book aggregation assistant. Your task is to process the sequence of images provided, which represent pages of a book. Extract the text content from each image independently and return them as an array of strings. Do not add any commentary or extra characters. The length of the output array MUST exactly match the number of images provided. If an image is blank, return an empty string for that page.";
+                const userQuery = `Perform OCR on these ${files.length} book pages and return the text for each page as a distinct item in a JSON array. The images are provided in sequential order.`;
+
+                const payload = {
+                    contents: [
+                        {
+                            role: "user",
+                            parts: [{ text: userQuery }, ...base64Parts]
+                        }
+                    ],
+                    systemInstruction: { parts: [{ text: systemPrompt }] },
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: {
+                            type: "ARRAY",
+                            items: { "type": "STRING" }
+                        }
+                    }
+                };
+
+                const apiKey = "";
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${VISION_MODEL}:generateContent?key=${apiKey}`;
+
+                let response;
+                let lastError = null;
+                for (let i = 0; i < 3; i++) { 
+                    const delay = Math.pow(2, i) * 2000;
+                    if (i > 0) await new Promise(resolve => setTimeout(resolve, delay));
+                    
+                    response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        break;
+                    } else if (response.status === 429 && i < 2) {
+                        lastError = `Rate limit exceeded. Retrying OCR in ${delay / 1000}s.`;
+                    } else {
+                        lastError = `HTTP Error: ${response.status} ${response.statusText}`;
+                        break;
+                    }
+                }
+
+                if (!response.ok) {
+                    throw new Error(lastError || "Failed to fetch OCR response after retries.");
+                }
+
+                const result = await response.json();
+                const jsonString = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                let extractedTexts;
+                
+                try {
+                    extractedTexts = JSON.parse(jsonString);
+                    if (!Array.isArray(extractedTexts)) throw new Error("API did not return a JSON array.");
+                } catch {
+                     // Fallback if parsing failed (e.g., model returned plain text)
+                    throw new Error("OCR failed to parse structured output. Text was likely not returned correctly.");
+                }
+
+                // Get the starting order number for the new pages
+                const startingOrder = window.currentPageList.length > 0 ? 
+                    window.currentPageList[window.currentPageList.length - 1].order + 1 : 
+                    0;
+                
+                // Save each transcribed text as a new page document
+                const pagePromises = extractedTexts.map((text, index) => {
+                    const newPageId = crypto.randomUUID();
+                    const newPageData = {
+                        text: text,
+                        order: startingOrder + index,
+                        createdAt: Date.now(),
+                    };
+                    const pageDocRef = window.doc(window.db, `artifacts/${window.__app_id}/users/${window.userId}/books/${window.currentBookId}/pages/${newPageId}`);
+                    return window.setDoc(pageDocRef, newPageData);
+                });
+
+                await Promise.all(pagePromises);
+                
+                ocrStatus.textContent = `OCR successful! ${extractedTexts.length} pages added.`;
+                ocrStatus.classList.remove('text-red-500', 'text-gray-600');
+                ocrStatus.classList.add('text-green-600');
+
+            } catch (error) {
+                console.error("OCR aggregation failed:", error);
+                ocrStatus.textContent = `OCR failed. Error: ${error.message}`;
+                ocrStatus.classList.remove('text-gray-600', 'text-green-600');
+                ocrStatus.classList.add('text-red-500');
+            } finally {
+                ocrButton.disabled = false;
+                document.getElementById('image-upload').value = '';
+                ocrButton.textContent = `Perform OCR & Add Pages (0 files selected)`;
+            }
+        }
+
+
+        /** Converts base64 PCM data to a WAV Blob. */
+        function pcmToWav(pcm16, sampleRate) {
+            const numChannels = 1;
+            const bytesPerSample = 2; // 16-bit PCM
+
+            const buffer = new ArrayBuffer(44 + pcm16.length * bytesPerSample);
+            const view = new DataView(buffer);
+
+            function writeString(view, offset, string) {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            }
+
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + pcm16.length * bytesPerSample, true); 
+            writeString(view, 8, 'WAVE');
+
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true); 
+            view.setUint16(20, 1, true); 
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * numChannels * bytesPerSample, true); 
+            view.setUint16(32, numChannels * bytesPerSample, true); 
+            view.setUint16(34, 16, true); 
+
+            writeString(view, 36, 'data');
+            view.setUint32(40, pcm16.length * bytesPerSample, true); 
+
+            let offset = 44;
+            for (let i = 0; i < pcm16.length; i++) {
+                view.setInt16(offset, pcm16[i], true);
+                offset += bytesPerSample;
+            }
+
+            return new Blob([view], { type: 'audio/wav' });
+        }
+        
+        /** Converts a base64 string to an ArrayBuffer. */
+        function base64ToArrayBuffer(base64) {
+            const binaryString = atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        /** Unified function to call the TTS API. */
+        async function fetchTtsAudio(textToSpeak, voiceName, statusElement, buttonToDisable) {
+            
+            buttonToDisable.disabled = true;
+            statusElement.textContent = `Status: Generating audio using ${voiceName}...`;
+            statusElement.classList.remove('text-red-500', 'text-green-600');
+            statusElement.classList.add('text-gray-600');
+
+            const payload = {
+                contents: [{
+                    parts: [{ text: textToSpeak }]
+                }],
+                generationConfig: {
+                    responseModalities: ["AUDIO"],
+                    speechConfig: {
+                        voiceConfig: {
+                            prebuiltVoiceConfig: { voiceName: voiceName }
+                        }
+                    }
+                },
+            };
+            
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${apiKey}`;
+
+            try {
+                let response;
+                let lastError = null;
+                for (let i = 0; i < 3; i++) { 
+                    const delay = Math.pow(2, i) * 1000;
+                    if (i > 0) await new Promise(resolve => setTimeout(resolve, delay));
+
+                    response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        break;
+                    } else if (response.status === 429 && i < 2) {
+                        lastError = `Rate limit exceeded. Retrying in ${delay / 1000}s.`;
+                        console.warn(`[TTS] ${lastError}`);
+                    } else {
+                        lastError = `HTTP Error: ${response.status} ${response.statusText}`;
+                        break;
+                    }
+                }
+
+                if (!response.ok) {
+                    throw new Error(lastError || "Failed to fetch response after retries.");
+                }
+
+                const result = await response.json();
+                const part = result?.candidates?.[0]?.content?.parts?.[0];
+                const audioData = part?.inlineData?.data;
+                const mimeType = part?.inlineData?.mimeType;
+
+                if (!audioData || !mimeType || !mimeType.startsWith("audio/L16")) {
+                    throw new Error("API response was missing expected audio data.");
+                }
+                
+                const rateMatch = mimeType.match(/rate=(\d+)/);
+                const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
+                
+                const pcmDataBuffer = base64ToArrayBuffer(audioData);
+                const pcm16 = new Int16Array(pcmDataBuffer);
+                const wavBlob = pcmToWav(pcm16, sampleRate);
+                
+                return wavBlob;
+
+            } catch (error) {
+                console.error("Audio generation failed:", error);
+                statusElement.textContent = `Generation failed. Error: ${error.message}`;
+                statusElement.classList.remove('text-gray-600', 'text-green-600');
+                statusElement.classList.add('text-red-500');
+                throw error; 
+            } finally {
+                buttonToDisable.disabled = false;
+            }
+        }
+
+        /** Generates the full audiobook narration by concatenating all page text. */
+        async function generateAudiobook() {
+            if (!window.currentBookId) {
+                document.getElementById('generation-status').textContent = "Error: Please select a book first.";
+                return;
+            }
+
+            const fullManuscript = window.currentPageList
+                .map(page => page.text)
+                .filter(text => text && text.trim().length > 0)
+                .join('\n\n'); // Use double newline as natural paragraph/page separator
+
+            if (fullManuscript.length === 0) {
+                 document.getElementById('generation-status').textContent = "Error: No text content found in any pages to narrate.";
+                return;
+            }
+            
+            const generateButton = document.getElementById('generate-button');
+            const statusElement = document.getElementById('generation-status');
+            const audioOutputDiv = document.getElementById('audio-output');
+            const audioPlayer = document.getElementById('audio-player');
+            const voiceName = document.getElementById('voice-select').value;
+
+            generatedAudioBlob = null;
+            document.getElementById('preview-status').textContent = "";
+            
+            try {
+                const wavBlob = await fetchTtsAudio(
+                    `Narrate the following story text: ${fullManuscript}`, 
+                    voiceName, 
+                    statusElement, 
+                    generateButton
+                );
+
+                generatedAudioBlob = wavBlob;
+                
+                const url = URL.createObjectURL(generatedAudioBlob);
+                audioPlayer.src = url;
+
+                statusElement.textContent = "Full narration generation complete!";
+                statusElement.classList.remove('text-red-500', 'text-gray-600');
+                statusElement.classList.add('text-green-600');
+
+                audioOutputDiv.classList.remove('hidden');
+                document.getElementById('no-audio-message').classList.add('hidden');
+                audioPlayer.play();
+
+            } catch (error) {
+                // Error handled inside fetchTtsAudio
+            }
+        }
+        
+        /** Generates a short audio preview of the selected voice. */
+        async function previewVoice() {
+            const previewButton = document.getElementById('preview-button');
+            const statusElement = document.getElementById('preview-status');
+            const audioOutputDiv = document.getElementById('audio-output');
+            const audioPlayer = document.getElementById('audio-player');
+            const voiceName = document.getElementById('voice-select').value;
+            
+            const textToSpeak = PREVIEW_TEXT;
+
+            try {
+                document.getElementById('generation-status').textContent = "Status: Ready to generate.";
+
+                const wavBlob = await fetchTtsAudio(
+                    textToSpeak, 
+                    voiceName, 
+                    statusElement, 
+                    previewButton
+                );
+                
+                const url = URL.createObjectURL(wavBlob);
+                audioPlayer.src = url;
+
+                statusElement.textContent = `Preview successful for ${voiceName}!`;
+                statusElement.classList.remove('text-red-500', 'text-gray-600');
+                statusElement.classList.add('text-green-600');
+
+                audioOutputDiv.classList.remove('hidden');
+                document.getElementById('no-audio-message').classList.add('hidden');
+                audioPlayer.play();
+
+            } catch (error) {
+                 // Error handled inside fetchTtsAudio
+            }
+        }
+
+        /** Handles the audio file download. */
+        function downloadAudio() {
+            if (!generatedAudioBlob) {
+                document.getElementById('generation-status').textContent = "Error: No full narration audio to download. Generate the full audiobook first.";
+                return;
+            }
+
+            const url = URL.createObjectURL(generatedAudioBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            const title = document.getElementById('book-title').value.trim() || 'audiobook_narration';
+            a.download = `${title.replace(/[^a-z0-9]/gi, '_')}.wav`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        
+    </script>
+</body>
+</html>
